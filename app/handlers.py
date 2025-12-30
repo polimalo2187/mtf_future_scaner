@@ -16,9 +16,9 @@ from app.referrals import get_user_referral_stats, get_referral_link, register_v
 logger = logging.getLogger(__name__)
 
 DAILY_LIMITS = {
-    PLAN_FREE: 3,
-    PLAN_PLUS: 5,
-    PLAN_PREMIUM: 7,
+    PLAN_FREE: 0,
+    PLAN_PLUS: 0,
+    PLAN_PREMIUM: 0,
 }
 
 # ======================================================

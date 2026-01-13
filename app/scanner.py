@@ -124,11 +124,11 @@ def telegram_signal_blocked(visibility: str) -> bool:
 # ======================================================
 
 def get_signal_visibility_by_score(score: float) -> str | None:
-    if score >= 75:
+    if score >= 90:
         return PLAN_PREMIUM
-    elif 65 <= score < 75:
+    elif 80 <= score < 89:
         return PLAN_PLUS
-    elif 55 <= score < 65:
+    elif 70 <= score < 79:
         return PLAN_FREE
     else:
         return None  # Score insuficiente → no se envía señal

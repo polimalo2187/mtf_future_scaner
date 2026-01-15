@@ -1,0 +1,307 @@
+# app/signals.py
+
+import os
+import time
+import logging
+import secrets
+import hashlib
+import random
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+
+import requests
+from app.models import new_signal
+from app.plans import PLAN_FREE, PLAN_PREMIUM
+from app.config import is_admin
+from app.database import signals_collection, user_signals_collection, users_collection
+import pytz
+
+logger = logging.getLogger(__name__)
+
+# ======================================================
+# CONFIGURACIÓN GLOBAL
+# ======================================================
+BINANCE_FUTURES_API = os.getenv("BINANCE_FUTURES_API", "https://fapi.binance.com")
+MAX_SIGNALS_PER_QUERY = int(os.getenv("MAX_SIGNALS_PER_QUERY", "10"))
+BINANCE_MAX_RETRIES = int(os.getenv("BINANCE_MAX_RETRIES", "3"))
+BINANCE_RETRY_DELAY = float(os.getenv("BINANCE_RETRY_DELAY", "1.0"))
+USER_TIMEZONE = os.getenv("USER_TIMEZONE", "America/Havana")
+
+LEVERAGE_PROFILES = {
+    "conservador": "5x-10x",
+    "moderado": "10x-20x",
+    "agresivo": "30x-40x",
+}
+
+TIMEFRAME_TO_MINUTES = {
+    "5M": 5,
+    "15M": 15,
+    "1H": 60,
+}
+
+DEDUP_MINUTES = int(os.getenv("DEDUP_MINUTES", "10"))
+TELEGRAM_SIGNAL_COOLDOWN_MINUTES = 15
+
+# ======================================================
+# UTILIDADES
+# ======================================================
+
+def calculate_signal_validity(timeframes: List[str]) -> int:
+    minutes = [TIMEFRAME_TO_MINUTES.get(tf.upper(), 0) for tf in timeframes]
+    return max(minutes) if minutes else 15
+
+def calculate_entry_zone(entry: float, pct: float = 0.0015):
+    low = round(entry * (1 - pct), 4)
+    high = round(entry * (1 + pct), 4)
+    return low, high
+
+def get_current_price(symbol: str) -> float:
+    url = f"{BINANCE_FUTURES_API}/fapi/v1/ticker/price"
+    for attempt in range(BINANCE_MAX_RETRIES):
+        try:
+            r = requests.get(url, params={"symbol": symbol}, timeout=10)
+            r.raise_for_status()
+            return float(r.json()["price"])
+        except Exception:
+            if attempt == BINANCE_MAX_RETRIES - 1:
+                raise
+            time.sleep(BINANCE_RETRY_DELAY)
+
+def estimate_minutes_to_entry(symbol: str, entry_zone: Dict[str, float], timeframes: List[str]) -> Dict[str, int]:
+    try:
+        current_price = get_current_price(symbol)
+        zone_mid = (entry_zone["low"] + entry_zone["high"]) / 2
+
+        if entry_zone["low"] <= current_price <= entry_zone["high"]:
+            return {"min": 1, "max": 5}
+
+        distance_pct = abs(current_price - zone_mid) / current_price
+
+        if "5M" in timeframes:
+            speed = 0.004
+            base_tf = 5
+        elif "15M" in timeframes:
+            speed = 0.0025
+            base_tf = 15
+        else:
+            speed = 0.0015
+            base_tf = calculate_signal_validity(timeframes)
+
+        candles_needed = max(1, distance_pct / speed)
+        minutes_estimated = candles_needed * base_tf
+
+        return {
+            "min": max(1, int(minutes_estimated * 0.6)),
+            "max": int(minutes_estimated * 1.4),
+        }
+    except Exception as e:
+        logger.warning(f"Fallback estimate_minutes_to_entry: {e}")
+        base = calculate_signal_validity(timeframes)
+        return {"min": max(1, int(base * 0.5)), "max": int(base * 1.5)}
+
+def recent_duplicate_exists(symbol: str, direction: str, visibility: str) -> bool:
+    since = datetime.utcnow() - timedelta(minutes=DEDUP_MINUTES)
+    exists = signals_collection().find_one({
+        "symbol": symbol,
+        "direction": direction,
+        "visibility": visibility,
+        "created_at": {"$gte": since},
+    }) is not None
+
+    if exists:
+        logger.info(f"♻️ Duplicado reciente detectado: {symbol} {direction} ({visibility})")
+    return exists
+
+def telegram_signal_blocked() -> bool:
+    since = datetime.utcnow() - timedelta(minutes=TELEGRAM_SIGNAL_COOLDOWN_MINUTES)
+    last_signal = signals_collection().find_one(
+        {"created_at": {"$gte": since}},
+        sort=[("created_at", -1)]
+    )
+    return last_signal is not None
+
+# ======================================================
+# CREAR SEÑAL BASE
+# ======================================================
+
+def create_base_signal(
+    symbol: str,
+    direction: str,
+    entry_price: float,
+    stop_loss: float,
+    take_profits: List[float],
+    timeframes: List[str],
+    visibility: str,
+    score: Optional[float] = None,
+    components: Optional[List[str]] = None
+) -> Dict:
+
+    if visibility is None:
+        visibility = PLAN_FREE
+
+    zone_low, zone_high = calculate_entry_zone(entry_price)
+    estimated_minutes = estimate_minutes_to_entry(symbol, {"low": zone_low, "high": zone_high}, timeframes)
+
+    signal = new_signal(
+        symbol=symbol,
+        direction=direction,
+        entry_price=float(entry_price),
+        stop_loss=float(stop_loss),
+        take_profits=[float(tp) for tp in take_profits],
+        timeframes=timeframes,
+        visibility=visibility,
+        leverage=LEVERAGE_PROFILES,
+        components=components,
+        score=score
+    )
+
+    now = datetime.utcnow()
+    inserted_id = signals_collection().insert_one(signal).inserted_id
+
+    signals_collection().update_one(
+        {"_id": inserted_id},
+        {"$set": {
+            "created_at": now,
+            "valid_until": now + timedelta(minutes=calculate_signal_validity(timeframes)),
+            "telegram_valid_until": now + timedelta(minutes=TELEGRAM_SIGNAL_COOLDOWN_MINUTES),
+            "entry_zone": {"low": zone_low, "high": zone_high},
+            "estimated_entry_minutes": estimated_minutes,
+        }}
+    )
+
+    signal["_id"] = inserted_id
+    signal["created_at"] = now
+    signal["valid_until"] = now + timedelta(minutes=calculate_signal_validity(timeframes))
+    signal["telegram_valid_until"] = now + timedelta(minutes=TELEGRAM_SIGNAL_COOLDOWN_MINUTES)
+    signal["entry_zone"] = {"low": zone_low, "high": zone_high}
+    signal["estimated_entry_minutes"] = estimated_minutes
+
+    generate_user_signal_for_plan(signal)
+    return signal
+
+# ======================================================
+# GENERAR SEÑAL USUARIO
+# ======================================================
+
+def generate_user_signal(base_signal: Dict, user_id: int) -> Dict:
+    seed = int(hashlib.sha256(f"{base_signal.get('_id')}_{user_id}".encode()).hexdigest(), 16)
+    rnd = random.Random(seed)
+
+    def vary(val: float, pct: float):
+        return round(rnd.uniform(val * (1 - pct), val * (1 + pct)), 4)
+
+    stop_loss_val = base_signal.get("stop_loss", base_signal.get("entry_price", 0) * 0.99)
+    take_profits_list = base_signal.get("take_profits", [base_signal.get("entry_price", 0) * 1.01])
+    user_entry = vary(base_signal.get("entry_price", 0), 0.0005)
+    zone_low, zone_high = calculate_entry_zone(user_entry)
+    estimated_minutes = estimate_minutes_to_entry(
+        base_signal.get("symbol", "UNKNOWN"),
+        {"low": zone_low, "high": zone_high},
+        base_signal.get("timeframes", ["5M"])
+    )
+
+    user_signal = {
+        "user_id": user_id,
+        "signal_id": str(base_signal.get("_id", "0")),
+        "symbol": base_signal.get("symbol", "UNKNOWN"),
+        "direction": base_signal.get("direction", "LONG"),
+        "entry_price": user_entry,
+        "entry_zone": {"low": zone_low, "high": zone_high},
+        "profiles": {
+            "conservador": {
+                "stop_loss": vary(stop_loss_val, 0.002),
+                "take_profits": [vary(tp, 0.0005) for tp in take_profits_list],
+            },
+            "moderado": {
+                "stop_loss": vary(stop_loss_val, 0.001),
+                "take_profits": [vary(tp, 0.001) for tp in take_profits_list],
+            },
+            "agresivo": {
+                "stop_loss": vary(stop_loss_val, 0.0005),
+                "take_profits": [vary(tp, 0.0015) for tp in take_profits_list],
+            },
+        },
+        "leverage_profiles": base_signal.get("leverage", LEVERAGE_PROFILES),
+        "timeframes": base_signal.get("timeframes", ["5M"]),
+        "created_at": datetime.utcnow(),
+        "valid_until": base_signal.get("valid_until", datetime.utcnow() + timedelta(minutes=15)),
+        "telegram_valid_until": base_signal.get("telegram_valid_until", datetime.utcnow() + timedelta(minutes=TELEGRAM_SIGNAL_COOLDOWN_MINUTES)),
+        "fingerprint": secrets.token_hex(4),
+        "visibility": base_signal.get("visibility", PLAN_FREE),
+        "estimated_entry_minutes": estimated_minutes,
+    }
+
+    user_signals_collection().insert_one(user_signal)
+    return user_signal
+
+# ======================================================
+# FORMATEAR SEÑAL PARA TELEGRAM
+# ======================================================
+
+def format_user_signal(user_signal: Dict) -> str:
+    tz = pytz.timezone(USER_TIMEZONE)
+    start_time = user_signal["created_at"].astimezone(tz).strftime("%H:%M")
+    end_time = user_signal["valid_until"].astimezone(tz).strftime("%H:%M")
+
+    plan = user_signal.get("visibility", PLAN_FREE).upper()
+    entry_base = user_signal.get("entry_price", 0)
+    symbol = user_signal.get("symbol", "UNKNOWN")
+    direction = user_signal.get("direction", "LONG")
+    timeframes = " / ".join(user_signal.get("timeframes", ["5M"]))
+
+    prof = user_signal.get("profiles", {})
+
+    text = (
+        f"📊 NUEVA SEÑAL – FUTUROS USDT\n\n"
+        f"🏷️ PLAN: {plan}\n\n"
+        f"Par: {symbol}\n"
+        f"Dirección: {direction}\n"
+        f"Entrada base: {entry_base}\n\n"
+        f"Margen: ISOLATED\n"
+        f"Timeframes: {timeframes}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"CONSERVADOR\n"
+        f"SL: {prof.get('conservador', {}).get('stop_loss')}\n"
+        f"TP1: {prof.get('conservador', {}).get('take_profits', [None])[0]}\n"
+        f"TP2: {prof.get('conservador', {}).get('take_profits', [None, None])[1]}\n"
+        f"Apalancamiento: {LEVERAGE_PROFILES['conservador']}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"MODERADO\n"
+        f"SL: {prof.get('moderado', {}).get('stop_loss')}\n"
+        f"TP1: {prof.get('moderado', {}).get('take_profits', [None])[0]}\n"
+        f"TP2: {prof.get('moderado', {}).get('take_profits', [None, None])[1]}\n"
+        f"Apalancamiento: {LEVERAGE_PROFILES['moderado']}\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"AGRESIVO\n"
+        f"SL: {prof.get('agresivo', {}).get('stop_loss')}\n"
+        f"TP1: {prof.get('agresivo', {}).get('take_profits', [None])[0]}\n"
+        f"TP2: {prof.get('agresivo', {}).get('take_profits', [None, None])[1]}\n"
+        f"Apalancamiento: {LEVERAGE_PROFILES['agresivo']}\n\n"
+        f"⏳ Activa: {start_time} → {end_time}\n"
+        f"🔐 ID: {user_signal.get('fingerprint')}\n"
+    )
+    return text
+
+# ======================================================
+# OBTENER ÚLTIMA BASE SIGNAL PARA UN USUARIO
+# ======================================================
+
+def get_latest_base_signal_for_plan(user_id: int, user_plan: Optional[str] = None):
+    if user_plan is None:
+        user_plan = PLAN_FREE
+
+    visibility = PLAN_PREMIUM if is_admin(user_id) else user_plan
+    now = datetime.utcnow()
+
+    signals = list(
+        user_signals_collection()
+        .find({
+            "user_id": user_id,
+            "visibility": visibility,
+            "telegram_valid_until": {"$gt": now}
+        })
+        .sort("created_at", -1)
+        .limit(MAX_SIGNALS_PER_QUERY)
+    )
+
+    return signals if signals else None
